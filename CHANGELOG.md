@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-05-20
+
+A small patch on top of 1.7.1: zero unnecessary macOS Keychain prompts on first launch, working cloud transcription on Electron's `net.fetch`, the Note Formatting selector now actually controls model routing, Wave Terminal pastes via the terminal path, and a notes view stability fix.
+
+### Desktop & permissions
+
+- **No more spurious macOS Keychain prompts on first launch.** Two changes drop first-launch prompts from ~3 to 0: the environment manager no longer eagerly probes the secret-crypto backend before any window appears (it now defers Keychain access until the user actually saves their first secret), and the `safeStorage` key-loss backup is written only when a new master key is generated, not on every launch.
+
+### Transcription
+
+- **Cloud transcription works again on Electron's `net.fetch`.** The 1.7.0 migration from `https.request` to `net.fetch` carried over a manual `Content-Length` header, which Electron rejects as a forbidden Fetch header — `net::ERR_INVALID_ARGUMENT` before any bytes hit the wire. All five upload callers (cloud-transcribe, chunked cloud transcribe, retry, file upload, BYOK whisper-compatible) now let `net.fetch` set Content-Length itself.
+
+### Notes
+
+- **Note Formatting selector now actually controls model routing.** The Note Formatting tab exposed model / mode / provider keys that no runtime path read — `actionProcessingStore` was overriding any caller-supplied model with `getEffectiveCleanupModel()`, so switching the selector was a no-op end-to-end. Generate Notes now resolves through the same per-scope plumbing as Cleanup, with a `dictationCleanup` fallback so users who never touched Note Formatting keep their existing behavior. Closes #784.
+- **Notes view state management.** Fixed a stale-ref issue where switching between notes could lose unsaved enhanced-content edits.
+
+### Linux
+
+- **Wave Terminal paste.** Added Wave Terminal to the terminal allowlist so auto-paste uses `Ctrl+Shift+V` instead of the default `Ctrl+V`. Closes #814.
+
 ## [1.7.1] - 2026-05-20
 
 A follow-up to 1.7.0 with a stronger encryption key for stored secrets, end-to-end voice activity detection on local Whisper, macOS mouse-button hotkeys, the full OpenAI Realtime GA migration, proxy-aware network paths, and a stack of platform fixes across Linux WMs, Intel Macs, and Windows.
