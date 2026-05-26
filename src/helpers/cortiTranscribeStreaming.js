@@ -58,8 +58,10 @@ class CortiTranscribeStreaming {
       );
     }
 
+    const configKey = `${clientId}:${region}:${tenant}`;
     if (
       this.clientCredsCache.token &&
+      this.clientCredsCache.configKey === configKey &&
       Date.now() < this.clientCredsCache.expiresAt - TOKEN_EXPIRY_BUFFER_MS
     ) {
       return this.clientCredsCache.token;
@@ -89,6 +91,7 @@ class CortiTranscribeStreaming {
     const data = await res.json();
     this.clientCredsCache.token = data.access_token;
     this.clientCredsCache.expiresAt = Date.now() + (data.expires_in || 300) * 1000;
+    this.clientCredsCache.configKey = configKey;
     debugLogger.debug("Corti client_credentials token fetched", { expiresIn: data.expires_in });
     return this.clientCredsCache.token;
   }
@@ -180,7 +183,7 @@ class CortiTranscribeStreaming {
       this.ws.on("error", (error) => {
         debugLogger.error("Corti WebSocket error", { error: error.message });
         if (error.message && (error.message.includes("401") || error.message.includes("403"))) {
-          this.tokenCache = { token: null, expiresAt: 0 };
+          this.clientCredsCache = { token: null, expiresAt: 0, configKey: null };
         }
         this.cleanup();
         if (this.pendingReject) {
@@ -391,7 +394,7 @@ class CortiTranscribeStreaming {
 
   cleanupAll() {
     this.cleanup();
-    this.tokenCache = { token: null, expiresAt: 0 };
+    this.clientCredsCache = { token: null, expiresAt: 0, configKey: null };
     this.finalSegments = [];
   }
 

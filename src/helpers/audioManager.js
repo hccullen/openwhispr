@@ -248,9 +248,12 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   getStreamingProvider() {
-    const { cloudTranscriptionModel } = getSettings();
-    if (REALTIME_MODELS.has(cloudTranscriptionModel)) {
+    const s = getSettings();
+    if (REALTIME_MODELS.has(s.cloudTranscriptionModel)) {
       return STREAMING_PROVIDERS["openai-realtime"];
+    }
+    if ((s.cloudTranscriptionProvider || "openai") === "corti") {
+      return STREAMING_PROVIDERS["corti-realtime"];
     }
     const defaultProvider = this.context === "notes" ? "deepgram" : "openai-realtime";
     const providerName = this.sttConfig?.streamingProvider || defaultProvider;
@@ -258,6 +261,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   getStreamingProviderName() {
+    const s = getSettings();
+    if ((s.cloudTranscriptionProvider || "openai") === "corti") {
+      return "corti-realtime";
+    }
     const defaultProvider = this.context === "notes" ? "deepgram" : "openai-realtime";
     return this.sttConfig?.streamingProvider || defaultProvider;
   }
@@ -2065,7 +2072,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     const s = getSettings();
     if (s.useLocalWhisper) return false;
 
-    // Corti realtime streaming — always streams when provider is corti-realtime
+    // Corti realtime streaming — when provider is corti and mode is websocket
+    if (
+      (s.cloudTranscriptionProvider || "openai") === "corti" &&
+      (s.cortiTranscriptionMode || "websocket") === "websocket"
+    ) {
+      return true;
+    }
     if (this.sttConfig?.streamingProvider === "corti-realtime") return true;
 
     // For dictation/agent: respect sttConfig mode from the API — this allows

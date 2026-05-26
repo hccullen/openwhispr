@@ -4366,7 +4366,10 @@ class IPCHandlers {
       const StreamingClass =
         STREAMING_CLIENT_BY_PROVIDER[options.provider] ?? OpenAIRealtimeStreaming;
       for (const { ref, source } of pairs) {
-        this[ref] = new StreamingClass();
+        this[ref] =
+          options.provider === "corti-realtime"
+            ? new StreamingClass(this.environmentManager, this.cortiOAuth)
+            : new StreamingClass();
         attachMeetingStreamingHandlers(this[ref], win, source);
       }
 

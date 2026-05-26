@@ -42,8 +42,10 @@ class CortiManager {
   }
 
   async _ensureClientCredsToken(clientId, clientSecret, region, tenant) {
+    const configKey = `${clientId}:${region}:${tenant}`;
     if (
       this.clientCredsCache.token &&
+      this.clientCredsCache.configKey === configKey &&
       Date.now() < this.clientCredsCache.expiresAt - TOKEN_EXPIRY_BUFFER_MS
     ) {
       return this.clientCredsCache.token;
@@ -73,6 +75,7 @@ class CortiManager {
     const data = await res.json();
     this.clientCredsCache.token = data.access_token;
     this.clientCredsCache.expiresAt = Date.now() + (data.expires_in || 300) * 1000;
+    this.clientCredsCache.configKey = configKey;
     debugLogger.debug("Corti client_credentials token fetched", { expiresIn: data.expires_in });
     return this.clientCredsCache.token;
   }
