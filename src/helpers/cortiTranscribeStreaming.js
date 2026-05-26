@@ -20,6 +20,10 @@ function normalizeLanguage(lang) {
   return lang && lang !== "auto" ? lang : "en";
 }
 
+function normalizePunctuationMode(mode) {
+  return mode === "spoken" || mode === "off" ? mode : "automatic";
+}
+
 function truncateDebugString(value) {
   if (typeof value !== "string") return value;
   if (value.length <= MAX_DEBUG_STRING_LENGTH) return value;
@@ -162,6 +166,12 @@ class CortiTranscribeStreaming {
     if (normalizeLanguage(this.connectionOptions.language) !== normalizeLanguage(options.language)) {
       return false;
     }
+    if (
+      normalizePunctuationMode(this.connectionOptions.punctuationMode) !==
+      normalizePunctuationMode(options.punctuationMode)
+    ) {
+      return false;
+    }
     return buildAudioFormatString(this.connectionOptions) === buildAudioFormatString(options);
   }
 
@@ -209,6 +219,7 @@ class CortiTranscribeStreaming {
       sampleRate: options.sampleRate,
       channels: options.channels,
       bitsPerSample: options.bitsPerSample,
+      punctuationMode: options.punctuationMode,
     };
     this.accumulatedText = "";
     this.finalSegments = [];
@@ -247,13 +258,16 @@ class CortiTranscribeStreaming {
 
         const lang = normalizeLanguage(options.language);
         const audioFormat = buildAudioFormatString(options);
+        const punctuationMode = normalizePunctuationMode(options.punctuationMode);
 
+        // Spoken punctuation isn't supported on /streams (per Corti docs), so on the
+        // streaming endpoint "spoken" and "off" both disable automatic punctuation.
         const configMsg = {
           type: "config",
           configuration: {
             primaryLanguage: lang,
             interimResults: true,
-            automaticPunctuation: true,
+            automaticPunctuation: punctuationMode === "automatic",
             audioFormat,
           },
         };

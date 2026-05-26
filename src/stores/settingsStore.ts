@@ -42,6 +42,53 @@ function readBoolean(key: string, fallback: boolean): boolean {
   return stored === "true";
 }
 
+export const CORTI_FORMATTING_DEFAULTS: CortiFormatting = {
+  dates: "locale:long",
+  times: "locale",
+  numbers: "numerals_above_nine",
+  measurements: "abbreviated",
+  numericRanges: "numerals",
+  ordinals: "numerals_above_nine",
+};
+
+export const CORTI_FORMATTING_OPTIONS: Record<keyof CortiFormatting, readonly string[]> = {
+  dates: ["locale:long", "locale:medium", "locale:short", "iso", "as_dictated"],
+  times: ["locale", "h24", "h12", "as_dictated"],
+  numbers: ["numerals_above_nine", "numerals", "as_dictated"],
+  measurements: ["abbreviated", "as_dictated"],
+  numericRanges: ["numerals", "as_dictated"],
+  ordinals: ["numerals_above_nine", "numerals", "as_dictated"],
+};
+
+export interface CortiFormatting {
+  dates: string;
+  times: string;
+  numbers: string;
+  measurements: string;
+  numericRanges: string;
+  ordinals: string;
+}
+
+function readCortiFormatting(): CortiFormatting {
+  if (!isBrowser) return { ...CORTI_FORMATTING_DEFAULTS };
+  const stored = localStorage.getItem("cortiFormatting");
+  if (!stored) return { ...CORTI_FORMATTING_DEFAULTS };
+  try {
+    const parsed = JSON.parse(stored);
+    if (!parsed || typeof parsed !== "object") return { ...CORTI_FORMATTING_DEFAULTS };
+    const out: CortiFormatting = { ...CORTI_FORMATTING_DEFAULTS };
+    for (const key of Object.keys(CORTI_FORMATTING_DEFAULTS) as (keyof CortiFormatting)[]) {
+      const v = parsed[key];
+      if (typeof v === "string" && CORTI_FORMATTING_OPTIONS[key].includes(v)) {
+        out[key] = v;
+      }
+    }
+    return out;
+  } catch {
+    return { ...CORTI_FORMATTING_DEFAULTS };
+  }
+}
+
 function readStringArray(key: string, fallback: string[]): string[] {
   if (!isBrowser) return fallback;
   const stored = localStorage.getItem(key);
@@ -486,6 +533,8 @@ export interface SettingsState
   setCortiEnvironment: (value: string) => void;
   setCortiTenant: (value: string) => void;
   setCortiTranscriptionMode: (value: "websocket" | "rest") => void;
+  setCortiPunctuationMode: (value: "automatic" | "spoken" | "off") => void;
+  setCortiFormatting: (value: Partial<CortiFormatting>) => void;
   setAutoGenerateNoteTitle: (value: boolean) => void;
   setUseCleanupModel: (value: boolean) => void;
   setUseDictationAgent: (value: boolean) => void;
@@ -718,6 +767,11 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   cortiEnvironment: readString("cortiEnvironment", "eu"),
   cortiTenant: readString("cortiTenant", "base"),
   cortiTranscriptionMode: (readString("cortiTranscriptionMode", "websocket") as "websocket" | "rest"),
+  cortiPunctuationMode: ((): "automatic" | "spoken" | "off" => {
+    const stored = readString("cortiPunctuationMode", "automatic");
+    return stored === "spoken" || stored === "off" ? stored : "automatic";
+  })(),
+  cortiFormatting: readCortiFormatting(),
 
   autoGenerateNoteTitle: readBoolean("autoGenerateNoteTitle", true),
   useCleanupModel: readBoolean("useCleanupModel", true),
@@ -1022,6 +1076,21 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   setCortiEnvironment: createStringSetter("cortiEnvironment"),
   setCortiTenant: createStringSetter("cortiTenant"),
   setCortiTranscriptionMode: createStringSetter("cortiTranscriptionMode") as (value: "websocket" | "rest") => void,
+  setCortiPunctuationMode: createStringSetter("cortiPunctuationMode") as (
+    value: "automatic" | "spoken" | "off"
+  ) => void,
+  setCortiFormatting: (value: Partial<CortiFormatting>) => {
+    const current = useSettingsStore.getState().cortiFormatting;
+    const next: CortiFormatting = { ...current };
+    for (const key of Object.keys(CORTI_FORMATTING_DEFAULTS) as (keyof CortiFormatting)[]) {
+      const v = value[key];
+      if (typeof v === "string" && CORTI_FORMATTING_OPTIONS[key].includes(v)) {
+        next[key] = v;
+      }
+    }
+    if (isBrowser) localStorage.setItem("cortiFormatting", JSON.stringify(next));
+    useSettingsStore.setState({ cortiFormatting: next });
+  },
   setAutoGenerateNoteTitle: createBooleanSetter("autoGenerateNoteTitle"),
   setUseCleanupModel: createBooleanSetter("useCleanupModel"),
   setUseDictationAgent: createBooleanSetter("useDictationAgent"),
@@ -1434,6 +1503,9 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
       s.setAssemblyAiStreaming(settings.assemblyAiStreaming);
     if (settings.showTranscriptionPreview !== undefined)
       s.setShowTranscriptionPreview(settings.showTranscriptionPreview);
+    if (settings.cortiPunctuationMode !== undefined)
+      s.setCortiPunctuationMode(settings.cortiPunctuationMode);
+    if (settings.cortiFormatting !== undefined) s.setCortiFormatting(settings.cortiFormatting);
   },
 
   updateCleanupSettings: (settings: Partial<CleanupSettings>) => {
