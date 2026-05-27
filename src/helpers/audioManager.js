@@ -1225,13 +1225,17 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       // 4. Connect WebSocket — audio is already flowing from the pipeline above,
       //    so Corti receives data immediately (no idle timeout).
       const result = await (async () => {
-        const { preferredLanguage: preferredLang, cortiPunctuationMode: punctuationMode } =
-          getSettings();
+        const {
+          preferredLanguage: preferredLang,
+          cortiPunctuationMode: punctuationMode,
+          cortiFormatting: formatting,
+        } = getSettings();
         const res = await provider.start({
           sampleRate: 16000,
           language: preferredLang && preferredLang !== "auto" ? preferredLang : undefined,
           keyterms: this.getKeyterms(),
           punctuationMode: punctuationMode || "automatic",
+          formatting,
         });
 
         if (!res.success) {

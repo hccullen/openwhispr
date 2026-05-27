@@ -572,46 +572,36 @@ function CortiSettingsPanel() {
                 {t("settingsPage.corti.punctuationOff", "Off")}
               </option>
             </select>
-            {mode === "websocket" && punctuationMode === "spoken" && (
-              <p className="text-xs text-amber-500 mt-1">
-                {t(
-                  "settingsPage.corti.punctuationSpokenStreamingWarning",
-                  "Spoken punctuation is not supported by Corti's streaming endpoint. Switch to REST mode, or punctuation will be disabled."
-                )}
-              </p>
-            )}
           </div>
 
-          {/* Dictation preferences: formatting (REST only per Corti docs) */}
-          {mode === "rest" && (
-            <div>
-              <label className="text-xs text-muted-foreground mb-1 block">
-                {t("settingsPage.corti.formattingLabel", "Formatting")}
-              </label>
-              <div className="grid grid-cols-2 gap-2">
-                {(Object.keys(CORTI_FORMATTING_OPTIONS) as (keyof CortiFormatting)[]).map(
-                  (field) => (
-                    <div key={field}>
-                      <label className="text-[10px] uppercase tracking-wide text-muted-foreground mb-0.5 block">
-                        {t(`settingsPage.corti.formatting.${field}`, field)}
-                      </label>
-                      <select
-                        className="w-full h-7 rounded-md border border-input bg-background px-2 text-xs"
-                        value={formatting[field]}
-                        onChange={(e) => setFormatting({ [field]: e.target.value })}
-                      >
-                        {CORTI_FORMATTING_OPTIONS[field].map((value) => (
-                          <option key={value} value={value}>
-                            {t(`settingsPage.corti.formattingValues.${value}`, value)}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  )
-                )}
-              </div>
+          {/* Dictation preferences: formatting — supported on both /transcribe (WSS) and REST */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1 block">
+              {t("settingsPage.corti.formattingLabel", "Formatting")}
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              {(Object.keys(CORTI_FORMATTING_OPTIONS) as (keyof CortiFormatting)[]).map(
+                (field) => (
+                  <div key={field}>
+                    <label className="text-[10px] uppercase tracking-wide text-muted-foreground mb-0.5 block">
+                      {t(`settingsPage.corti.formatting.${field}`, field)}
+                    </label>
+                    <select
+                      className="w-full h-7 rounded-md border border-input bg-background px-2 text-xs"
+                      value={formatting[field]}
+                      onChange={(e) => setFormatting({ [field]: e.target.value })}
+                    >
+                      {CORTI_FORMATTING_OPTIONS[field].map((value) => (
+                        <option key={value} value={value}>
+                          {t(`settingsPage.corti.formattingValues.${value}`, value)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )
+              )}
             </div>
-          )}
+          </div>
 
           {/* Primary auth action */}
           <div className="flex items-center gap-2">
