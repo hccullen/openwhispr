@@ -10,6 +10,7 @@ const GnomeShortcutManager = require("./gnomeShortcut");
 const HyprlandShortcutManager = require("./hyprlandShortcut");
 const { i18nMain, changeLanguage } = require("./i18nMain");
 const CortiTranscribeStreaming = require("./cortiTranscribeStreaming");
+const CortiNoteStreaming = require("./cortiNoteStreaming");
 const CortiManager = require("./cortiManager");
 const CortiOAuth = require("./cortiOAuth");
 const AudioStorageManager = require("./audioStorage");
@@ -38,10 +39,135 @@ const {
   resolveContextSileroEnabled,
 } = require("./whisperVadConfig");
 
+// Dictation uses CortiTranscribeStreaming (/transcribe — stateless, single
+// speaker). Notes / meetings use CortiNoteStreaming (/streams — interaction-
+// bound, diarized). Both are WSS endpoints; /transcripts (REST) is forbidden.
 const STREAMING_CLIENT_BY_PROVIDER = {
-  "corti-realtime": CortiTranscribeStreaming,
+  "corti-realtime": CortiNoteStreaming,
 };
 const ALLOWED_MEETING_PROVIDERS = new Set(["corti-realtime"]);
+
+// Meeting audio is captured as mono Int16 PCM at 24 kHz on both mic and system
+// pipelines, and Corti's /streams supports per-channel speaker attribution when
+// stereo (one channel per source) is supplied. The interleaver below pairs
+// matching-sized frames from the mic and system queues and emits standard
+// interleaved Int16LE stereo PCM. If one side stalls beyond GAP_PADDING_MS we
+// pad with silence on that channel so the other side isn't blocked.
+const MEETING_PCM_SAMPLE_RATE = 24000;
+const MEETING_INTERLEAVER_FRAME_SAMPLES = 480; // 20 ms @ 24 kHz
+const MEETING_INTERLEAVER_GAP_PADDING_MS = 120;
+
+class MeetingAudioInterleaver {
+  constructor({ frameSamples, gapPaddingMs, onFrame }) {
+    this.frameSamples = frameSamples;
+    this.gapPaddingMs = gapPaddingMs;
+    this.onFrame = onFrame;
+    this.queues = [[], []];
+    this.bytesInQueue = [0, 0];
+    this.lastPushAt = [0, 0];
+    this.paddingTimer = null;
+    this.closed = false;
+  }
+
+  push(channel, buffer) {
+    if (this.closed) return;
+    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+    if (buf.length === 0) return;
+    this.queues[channel].push(buf);
+    this.bytesInQueue[channel] += buf.length;
+    this.lastPushAt[channel] = Date.now();
+    this._drain();
+    this._scheduleGapPadding();
+  }
+
+  _drain() {
+    const bytesPerChannelFrame = this.frameSamples * 2; // Int16 = 2 bytes
+    while (
+      this.bytesInQueue[0] >= bytesPerChannelFrame &&
+      this.bytesInQueue[1] >= bytesPerChannelFrame
+    ) {
+      const ch0 = this._popBytes(0, bytesPerChannelFrame);
+      const ch1 = this._popBytes(1, bytesPerChannelFrame);
+      this.onFrame(this._interleave(ch0, ch1));
+    }
+  }
+
+  _popBytes(channel, byteCount) {
+    const out = Buffer.alloc(byteCount);
+    let written = 0;
+    while (written < byteCount && this.queues[channel].length > 0) {
+      const head = this.queues[channel][0];
+      const need = byteCount - written;
+      if (head.length <= need) {
+        head.copy(out, written);
+        written += head.length;
+        this.bytesInQueue[channel] -= head.length;
+        this.queues[channel].shift();
+      } else {
+        head.copy(out, written, 0, need);
+        written += need;
+        this.bytesInQueue[channel] -= need;
+        this.queues[channel][0] = head.slice(need);
+      }
+    }
+    return out;
+  }
+
+  _interleave(ch0Bytes, ch1Bytes) {
+    const sampleCount = this.frameSamples;
+    const out = Buffer.alloc(sampleCount * 4); // 2 channels × Int16
+    for (let i = 0; i < sampleCount; i++) {
+      out.writeInt16LE(ch0Bytes.readInt16LE(i * 2), i * 4);
+      out.writeInt16LE(ch1Bytes.readInt16LE(i * 2), i * 4 + 2);
+    }
+    return out;
+  }
+
+  _scheduleGapPadding() {
+    if (this.paddingTimer || this.closed) return;
+    this.paddingTimer = setTimeout(() => {
+      this.paddingTimer = null;
+      this._padStalledChannel();
+    }, this.gapPaddingMs);
+  }
+
+  _padStalledChannel() {
+    if (this.closed) return;
+    const now = Date.now();
+    const bytesPerChannelFrame = this.frameSamples * 2;
+    for (const stalled of [0, 1]) {
+      const other = stalled === 0 ? 1 : 0;
+      if (
+        this.bytesInQueue[other] >= bytesPerChannelFrame &&
+        this.bytesInQueue[stalled] < this.bytesInQueue[other] &&
+        now - this.lastPushAt[stalled] >= this.gapPaddingMs
+      ) {
+        const pad = this.bytesInQueue[other] - this.bytesInQueue[stalled];
+        this.queues[stalled].push(Buffer.alloc(pad));
+        this.bytesInQueue[stalled] += pad;
+      }
+    }
+    this._drain();
+    if (this.bytesInQueue[0] > 0 || this.bytesInQueue[1] > 0) {
+      this._scheduleGapPadding();
+    }
+  }
+
+  reset() {
+    if (this.paddingTimer) clearTimeout(this.paddingTimer);
+    this.paddingTimer = null;
+    this.queues = [[], []];
+    this.bytesInQueue = [0, 0];
+    this.lastPushAt = [0, 0];
+    this.closed = false;
+  }
+
+  close() {
+    this.closed = true;
+    if (this.paddingTimer) clearTimeout(this.paddingTimer);
+    this.paddingTimer = null;
+  }
+}
 
 function parseAttendees(raw) {
   if (!raw) return [];
@@ -283,8 +409,7 @@ class IPCHandlers {
     this.cortiStreaming = null;
     this.cortiOAuth = new CortiOAuth(this.environmentManager);
     this.cortiManager = new CortiManager(this.environmentManager, this.cortiOAuth);
-    this._meetingMicStreaming = null;
-    this._meetingSystemStreaming = null;
+    this._meetingStreaming = null;
     this._hotkeyCaptureMode = false;
     // Auto-learn is force-disabled. The Windows TextPattern read returns
     // viewport text for Monaco-style editors, which polluted the dictionary
@@ -3392,11 +3517,19 @@ class IPCHandlers {
       meetingLocalTranscript += `${meetingLocalTranscript ? " " : ""}${text}`;
     };
 
-    const storeMeetingDiarizationSegment = (text, source, timestamp, micSuppression = null) => {
+    const storeMeetingDiarizationSegment = (
+      text,
+      source,
+      timestamp,
+      micSuppression = null,
+      meta = {}
+    ) => {
       meetingDiarizationSegments.push({
         text,
         source,
         timestamp,
+        channel: meta.channel ?? null,
+        cortiSpeakerId: meta.speakerId ?? null,
         suppressionReason: source === "mic" ? micSuppression?.reason || null : null,
         hasBleedEvidence: source === "mic" ? !!micSuppression?.hasBleedEvidence : false,
         likelyRenderBleed: source === "mic" ? !!micSuppression?.likelyRenderBleed : false,
@@ -3410,12 +3543,17 @@ class IPCHandlers {
       micSuppression = null,
       send = null,
       includeInLocalTranscript = false,
+      channel = null,
+      speakerId = null,
     }) => {
       if (includeInLocalTranscript) {
         appendMeetingLocalTranscript(text);
       }
 
-      storeMeetingDiarizationSegment(text, source, timestamp, micSuppression);
+      storeMeetingDiarizationSegment(text, source, timestamp, micSuppression, {
+        channel,
+        speakerId,
+      });
 
       if (send) {
         send("meeting-transcription-segment", {
@@ -3423,6 +3561,8 @@ class IPCHandlers {
           source,
           type: "final",
           timestamp,
+          channel,
+          speakerId,
         });
       }
     };
@@ -3563,118 +3703,52 @@ class IPCHandlers {
       return { diarizationPcmPath, diarizationSegments, diarizationStartedAt };
     };
 
-    const attachMeetingStreamingHandlers = (streaming, win, source) => {
-      const send = (channel, data) => {
+    const attachMeetingStreamingHandlers = (streaming, win, channelSourceMap) => {
+      const resolveSource = (channel) =>
+        channelSourceMap[channel] || channelSourceMap[0] || "mic";
+
+      const send = (ipcChannel, data) => {
         if (!win || win.isDestroyed()) {
           debugLogger.error("Meeting segment send failed: window unavailable", {
-            channel,
-            source,
+            ipcChannel,
             winExists: !!win,
           });
           return;
         }
-        win.webContents.send(channel, data);
+        win.webContents.send(ipcChannel, data);
       };
 
-      streaming.onPartialTranscript = (text) => {
-        if (source === "mic" && meetingEchoLeakDetector.isMicProbablyRenderBleed()) {
-          send("meeting-transcription-segment", { text: "", source, type: "partial" });
-          return;
-        }
-
-        send("meeting-transcription-segment", { text, source, type: "partial" });
-      };
-      streaming.onFinalTranscript = (text, timestamp) => {
-        const segments = streaming.completedSegments;
-        const latestSegment = segments.length > 0 ? segments[segments.length - 1] : text;
-        let micSuppression = null;
-        if (source === "mic") {
-          micSuppression = shouldSuppressMicTranscriptSegment(timestamp, Date.now());
-          if (micSuppression.suppress) {
-            debugLogger.debug("Suppressing contaminated mic segment", {
-              reason: micSuppression.reason,
-              averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
-              averageResidual: micSuppression.averageResidual?.toFixed(3),
-              text: latestSegment.slice(0, 80),
-            });
-            send("meeting-transcription-segment", { text: "", source, type: "partial" });
-            return;
-          }
-
-          if (shouldSkipDuplicateMicSegment(latestSegment, timestamp, micSuppression)) {
-            debugLogger.debug("Skipping duplicate mic segment that matches recent system audio", {
-              text: latestSegment.slice(0, 80),
-              averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
-              averageResidual: micSuppression.averageResidual?.toFixed(3),
-            });
-            send("meeting-transcription-segment", { text: "", source, type: "partial" });
-            return;
-          }
-        }
-
-        if (source === "system") {
-          const pending = removePendingMicFinalsFor(latestSegment, timestamp);
-          if (pending.length > 0) {
-            debugLogger.debug("Dropping buffered mic segments after system transcript arrived", {
-              count: pending.length,
-              text: latestSegment.slice(0, 80),
-            });
-          }
-
-          const retracted = removeRacingMicEntriesFor(latestSegment, timestamp);
-          for (const stale of retracted) {
-            send("meeting-transcription-segment", {
-              text: stale.text,
-              source: "mic",
-              type: "retract",
-              timestamp: stale.timestamp,
-            });
-          }
-        }
-
-        debugLogger.debug("Meeting segment sending to renderer", {
+      streaming.onPartialTranscript = (text, meta = {}) => {
+        const source = resolveSource(meta.channel);
+        send("meeting-transcription-segment", {
+          text,
           source,
-          text: latestSegment.slice(0, 80),
-          segmentCount: segments.length,
-          micCorrelation: micSuppression?.averageCorrelation?.toFixed(3),
-          micSuppressionReason: micSuppression?.reason,
-          micHasBleedEvidence: micSuppression?.hasBleedEvidence,
-          micLikelyRenderBleed: micSuppression?.likelyRenderBleed,
-          systemSpeaking: micSuppression?.systemSpeaking,
+          type: "partial",
+          channel: meta.channel ?? null,
+          speakerId: meta.speakerId ?? null,
         });
-        if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {
-          debugLogger.debug("Buffering risky mic segment before renderer commit", {
-            text: latestSegment.slice(0, 80),
-            holdbackMs: STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS,
-            reason: micSuppression?.reason,
-            hasBleedEvidence: micSuppression?.hasBleedEvidence,
-          });
-          send("meeting-transcription-segment", { text: "", source, type: "partial" });
-          queuePendingMicFinal({
-            text: latestSegment,
-            timestamp,
-            micSuppression,
-            holdbackMs: STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS,
-            emit: () =>
-              sendMeetingFinalSegment({
-                text: latestSegment,
-                source,
-                timestamp,
-                micSuppression,
-                send,
-              }),
-          });
-          return;
-        }
+      };
 
+      streaming.onFinalTranscript = (text, timestamp, meta = {}) => {
+        const source = resolveSource(meta.channel);
+        const segmentText = meta.segmentText || text;
+        debugLogger.debug("Meeting segment received", {
+          source,
+          channel: meta.channel,
+          speakerId: meta.speakerId,
+          text: segmentText.slice(0, 80),
+        });
         sendMeetingFinalSegment({
-          text: latestSegment,
+          text: segmentText,
           source,
           timestamp,
-          micSuppression,
+          micSuppression: null,
           send,
+          channel: meta.channel ?? null,
+          speakerId: meta.speakerId ?? null,
         });
       };
+
       streaming.onError = (error) => {
         send("meeting-transcription-error", error.message);
       };
@@ -3813,55 +3887,52 @@ class IPCHandlers {
 
     const hasNativeMeetingSystemAudio = () => getMeetingSystemAudioMode() === "native";
 
-    const isMeetingStreamingConnected = (systemAudioMode = getMeetingSystemAudioCapabilityMode()) =>
-      !!this._meetingMicStreaming?.isConnected &&
-      (systemAudioMode === "unsupported" || !!this._meetingSystemStreaming?.isConnected);
+    const isMeetingStreamingConnected = () => !!this._meetingStreaming?.isConnected;
+
+    const meetingChannelSourceMap = (multichannel) =>
+      multichannel ? { 0: "mic", 1: "system" } : { 0: "mic" };
 
     const connectRealtimeStreaming = async (event, options) => {
-      if (this._meetingMicStreaming?.isConnected) {
-        await this._meetingMicStreaming.disconnect();
+      if (this._meetingStreaming?.isConnected) {
+        await this._meetingStreaming.disconnect();
       }
-      if (this._meetingSystemStreaming?.isConnected) {
-        await this._meetingSystemStreaming.disconnect();
-      }
-      this._meetingMicStreaming = null;
-      this._meetingSystemStreaming = null;
+      this._meetingStreaming = null;
+      meetingInterleaver?.reset();
+      meetingInterleaver = null;
+
       const win = BrowserWindow.fromWebContents(event.sender);
 
-      const connectOpts = {
-        model: options.model,
-        language: options.language,
-        preconfigured: options.mode !== "byok",
-      };
       const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
-      let pairs;
-      if (systemAudioMode !== "unsupported") {
-        const secrets = await fetchRealtimeToken(event, options, { streams: 2 });
-        pairs = [
-          { ref: "_meetingMicStreaming", secret: secrets[0], source: "mic" },
-          { ref: "_meetingSystemStreaming", secret: secrets[1], source: "system" },
-        ];
-      } else {
-        pairs = [
-          {
-            ref: "_meetingMicStreaming",
-            secret: await fetchRealtimeToken(event, options),
-            source: "mic",
-          },
-        ];
-      }
+      const multichannel = systemAudioMode !== "unsupported";
 
       const StreamingClass = STREAMING_CLIENT_BY_PROVIDER["corti-realtime"];
-      for (const { ref, source } of pairs) {
-        this[ref] = new StreamingClass(this.environmentManager, this.cortiOAuth);
-        attachMeetingStreamingHandlers(this[ref], win, source);
+      this._meetingStreaming = new StreamingClass(this.environmentManager, this.cortiOAuth);
+      attachMeetingStreamingHandlers(
+        this._meetingStreaming,
+        win,
+        meetingChannelSourceMap(multichannel)
+      );
+
+      // Stereo path: channel 0 = mic, channel 1 = system. Chunks are interleaved
+      // in main process before being sent to the single WSS. Mono path (mic-only
+      // fallback) bypasses the interleaver and ships mic chunks straight through.
+      if (multichannel) {
+        meetingInterleaver = new MeetingAudioInterleaver({
+          sampleRate: MEETING_PCM_SAMPLE_RATE,
+          frameSamples: MEETING_INTERLEAVER_FRAME_SAMPLES,
+          gapPaddingMs: MEETING_INTERLEAVER_GAP_PADDING_MS,
+          onFrame: (frame) => this._meetingStreaming?.sendAudio(frame),
+        });
       }
 
-      await Promise.all(
-        pairs.map(({ ref, secret }) =>
-          this[ref].connect({ apiKey: secret, token: secret, ...connectOpts })
-        )
-      );
+      await this._meetingStreaming.connect({
+        language: options.language,
+        punctuationMode: options.punctuationMode,
+        formatting: options.formatting,
+        multichannel,
+        sampleRate: MEETING_PCM_SAMPLE_RATE,
+        bitsPerSample: 16,
+      });
 
       return win;
     };
@@ -3875,6 +3946,7 @@ class IPCHandlers {
     let meetingMicStatsLogCount = 0;
     let meetingStartedAt = null;
     let meetingSendCounts = { mic: 0, system: 0 };
+    let meetingInterleaver = null;
     const meetingEchoLeakDetector = new MeetingEchoLeakDetector();
 
     const fs = require("fs");
@@ -3987,7 +4059,7 @@ class IPCHandlers {
         return;
       }
 
-      const streaming = source === "mic" ? this._meetingMicStreaming : this._meetingSystemStreaming;
+      const streaming = this._meetingStreaming;
       if (!streaming) {
         if (meetingSendCounts[source] === 0) {
           debugLogger.error("Meeting audio send: no streaming instance", { source });
@@ -3995,52 +4067,21 @@ class IPCHandlers {
         return;
       }
 
-      let outbound = buffer;
-      if (source === "mic" && buffer.length >= 2) {
-        const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length >> 1);
-        let sumSq = 0;
-        let peak = 0;
-        for (let i = 0; i < samples.length; i++) {
-          const n = samples[i] / 0x7fff;
-          sumSq += n * n;
-          const abs = n < 0 ? -n : n;
-          if (abs > peak) peak = abs;
-        }
-        const rms = Math.sqrt(sumSq / samples.length);
-        const systemSpeaking = meetingEchoLeakDetector.isSystemSpeaking(
-          Date.now() - MEETING_MIC_BLEED_LOOKBACK_MS
-        );
-        if (rms < 0.0015 && peak < 0.05) {
-          outbound = Buffer.alloc(buffer.length);
-        } else if (
-          rms < MEETING_MIC_BLEED_RMS_CEILING &&
-          peak < MEETING_MIC_BLEED_PEAK_CEILING &&
-          systemSpeaking
-        ) {
-          outbound = Buffer.alloc(buffer.length);
-        }
-        if (
-          meetingMicStatsLogCount < MEETING_MIC_STATS_LOG_LIMIT &&
-          (systemSpeaking || rms > 0.02)
-        ) {
-          meetingMicStatsLogCount += 1;
-          debugLogger.debug("Meeting mic audio stats", {
-            rms: rms.toFixed(4),
-            peak: peak.toFixed(4),
-            systemSpeaking,
-            zeroed: outbound !== buffer,
-          });
-        }
+      if (meetingInterleaver) {
+        meetingInterleaver.push(source === "mic" ? 0 : 1, buffer);
+      } else if (source === "mic") {
+        streaming.sendAudio(buffer);
+      } else {
+        // Mono mic-only mode: system audio chunks have nowhere to go.
+        return;
       }
 
-      const sent = streaming.sendAudio(outbound);
       meetingSendCounts[source]++;
       if (meetingSendCounts[source] <= 5 || meetingSendCounts[source] % 100 === 0) {
         debugLogger.debug("Meeting audio send", {
           source,
           bytes: buffer.length,
-          sent,
-          wsReady: streaming.ws?.readyState,
+          multichannel: !!meetingInterleaver,
           totalSent: streaming.audioBytesSent,
           count: meetingSendCounts[source],
         });
@@ -4565,8 +4606,11 @@ class IPCHandlers {
     };
 
     const resetMeetingStreamingState = () => {
-      this._meetingMicStreaming = null;
-      this._meetingSystemStreaming = null;
+      this._meetingStreaming = null;
+      if (meetingInterleaver) {
+        meetingInterleaver.close();
+        meetingInterleaver = null;
+      }
       meetingSendCounts = { mic: 0, system: 0 };
       meetingLiveSpeakerStartedAt = null;
       meetingPendingMicChunks = [];
@@ -4576,21 +4620,16 @@ class IPCHandlers {
     };
 
     const disconnectMeetingStreaming = async ({ flushPending = false } = {}) => {
-      const results = await Promise.all([
-        this._meetingMicStreaming
-          ? this._meetingMicStreaming.disconnect().catch(() => ({ text: "" }))
-          : Promise.resolve({ text: "" }),
-        this._meetingSystemStreaming
-          ? this._meetingSystemStreaming.disconnect().catch(() => ({ text: "" }))
-          : Promise.resolve({ text: "" }),
-      ]);
+      const result = this._meetingStreaming
+        ? await this._meetingStreaming.disconnect().catch(() => ({ text: "" }))
+        : { text: "" };
 
       if (flushPending) {
         flushPendingMicFinals(true);
       }
 
       resetMeetingStreamingState();
-      return results;
+      return result;
     };
 
     const rollbackMeetingTranscriptionStart = async () => {
@@ -4605,6 +4644,368 @@ class IPCHandlers {
       resetMeetingLocalState();
       await disconnectMeetingStreaming().catch(() => {});
     };
+
+    const sendMeetingAudio = (audioBuffer, source) => {
+      const outboundBuffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
+
+      if (source === "system") {
+        const receivedAt = Date.now();
+        meetingEchoLeakDetector.recordSystemChunk(outboundBuffer, receivedAt);
+        if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(outboundBuffer)) {
+          meetingAecEnabled = false;
+        }
+        flushPendingMeetingMicChunks();
+
+        if (meetingLiveSpeakerActive) {
+          void liveSpeakerIdentifier.feedAudio(outboundBuffer);
+        }
+
+        if (!meetingDiarizationStream) {
+          meetingDiarizationPath = path.join(os.tmpdir(), `ow-diarize-raw-${Date.now()}.pcm`);
+          meetingDiarizationStream = fs.createWriteStream(meetingDiarizationPath);
+          meetingDiarizationStartedAt = receivedAt;
+        }
+        meetingDiarizationStream.write(outboundBuffer);
+        dispatchMeetingAudioBuffer(outboundBuffer, "system");
+        return;
+      }
+
+      if (source === "mic") {
+        if (processMeetingMicWithAec(outboundBuffer)) {
+          return;
+        }
+
+        if (!hasNativeMeetingSystemAudio()) {
+          const analysis = meetingEchoLeakDetector.analyzeMicChunk(outboundBuffer);
+          if (analysis?.shouldMute && !meetingAecEnabled) {
+            if (!meetingLocalMode) {
+              dispatchMeetingAudioBuffer(Buffer.alloc(outboundBuffer.length), "mic");
+            }
+            return;
+          }
+          dispatchMeetingAudioBuffer(outboundBuffer, "mic");
+          return;
+        }
+
+        meetingPendingMicChunks.push({ buffer: outboundBuffer, queuedAt: Date.now() });
+        flushPendingMeetingMicChunks();
+      }
+    };
+
+    const startNativeMeetingSystemAudio = async (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      await this.audioTapManager.start({
+        onChunk: (chunk) => sendMeetingAudio(chunk, "system"),
+        onError: (error) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("meeting-transcription-error", error.message);
+          }
+        },
+      });
+    };
+
+    const startLinuxMeetingSystemAudio = async (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      await this.linuxPortalAudioManager.start({
+        onChunk: (chunk) => sendMeetingAudio(chunk, "system"),
+        onError: (error) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("meeting-transcription-error", error.message);
+          }
+        },
+        onWarning: (warning) => {
+          debugLogger.warn(
+            "Linux portal system audio warning",
+            { code: warning.code, message: warning.message },
+            "meeting"
+          );
+        },
+      });
+    };
+
+    const startMeetingSystemAudio = async (event, systemAudioMode, systemAudioStrategy, context) => {
+      if (systemAudioMode === "native") {
+        try {
+          await startNativeMeetingSystemAudio(event);
+          return { systemAudioMode, systemAudioStrategy };
+        } catch (error) {
+          debugLogger.warn(
+            `Native system audio tap failed ${context}, falling back to mic-only`,
+            { error: error.message },
+            "meeting"
+          );
+          // No need to tear down the WSS — the interleaver will pad silence on
+          // channel 1 when no system chunks arrive. Speaker ID still runs on
+          // the mic channel only.
+          await stopLiveSpeakerIdentification().catch(() => {});
+          return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
+        }
+      }
+
+      if (systemAudioStrategy !== "portal-helper") {
+        return { systemAudioMode, systemAudioStrategy };
+      }
+
+      try {
+        await startLinuxMeetingSystemAudio(event);
+        return { systemAudioMode, systemAudioStrategy };
+      } catch (error) {
+        debugLogger.warn(
+          `Linux portal helper failed ${context}, falling back to browser portal`,
+          { error: error.message },
+          "meeting"
+        );
+        return { systemAudioMode, systemAudioStrategy: "browser-portal" };
+      }
+    };
+
+    ipcMain.handle("meeting-transcription-prepare", async (event, options = {}) => {
+      if (meetingTranscriptionPrepareInProgress || meetingTranscriptionStartInProgress) {
+        return { success: false, error: "Operation in progress" };
+      }
+
+      const provider = options.provider === "local" ? "local" : "corti-realtime";
+
+      if (provider === "local") {
+        return { success: true };
+      }
+
+      const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
+
+      if (isMeetingStreamingConnected(systemAudioMode)) {
+        return { success: true, alreadyPrepared: true };
+      }
+
+      meetingTranscriptionPrepareInProgress = true;
+      meetingTranscriptionPreparePromise = (async () => {
+        let timeoutHandle;
+        try {
+          await Promise.race([
+            connectRealtimeStreaming(event, { ...options, provider }),
+            new Promise((_, reject) => {
+              timeoutHandle = setTimeout(() => reject(new Error("Prepare timed out")), 30000);
+            }),
+          ]);
+          return { success: true };
+        } catch (error) {
+          debugLogger.error("Meeting transcription prepare error", { error: error.message });
+          return { success: false, error: error.message };
+        } finally {
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          meetingTranscriptionPrepareInProgress = false;
+          meetingTranscriptionPreparePromise = null;
+        }
+      })();
+
+      return meetingTranscriptionPreparePromise;
+    });
+
+    ipcMain.handle("meeting-transcription-cancel", async () => {
+      if (isMeetingStreamingConnected() || meetingLocalTimer) {
+        return { success: false, reason: "recording-active" };
+      }
+      meetingTranscriptionPrepareInProgress = false;
+      meetingTranscriptionStartInProgress = false;
+      meetingTranscriptionPreparePromise = null;
+      await disconnectMeetingStreaming().catch(() => {});
+      return { success: true };
+    });
+
+    ipcMain.handle("meeting-transcription-start", async (event, options = {}) => {
+      if (meetingTranscriptionPreparePromise) {
+        await meetingTranscriptionPreparePromise;
+      }
+
+      if (meetingTranscriptionStartInProgress) {
+        return { success: false, error: "Operation in progress" };
+      }
+
+      // Renderer may send "openai-realtime" etc. when the cloud catalog hasn't
+      // loaded; Corti is the only supported cloud provider so coerce here.
+      const provider = options.provider === "local" ? "local" : "corti-realtime";
+      const normalizedOptions = { ...options, provider };
+
+      meetingTranscriptionStartInProgress = true;
+      meetingStartedAt = Date.now();
+      this.meetingDetectionEngine?.setUserRecording(true);
+      try {
+        const systemAudioPlan = await getMeetingSystemAudioPlan();
+        let { mode: systemAudioMode, strategy: systemAudioStrategy } = systemAudioPlan;
+        meetingEchoLeakDetector.reset();
+        meetingOneOnOneAttendee = resolveOneOnOneAttendeeForNote(normalizedOptions.noteId);
+        meetingOneOnOneProfileBound = false;
+        meetingNoteId = normalizedOptions.noteId ?? null;
+
+        if (!meetingLocalMode && isMeetingStreamingConnected()) {
+          const win = BrowserWindow.fromWebContents(event.sender);
+          const multichannel = systemAudioMode !== "unsupported";
+          attachMeetingStreamingHandlers(
+            this._meetingStreaming,
+            win,
+            meetingChannelSourceMap(multichannel)
+          );
+          await startMeetingAec(systemAudioMode);
+          await startLiveSpeakerIdentification(win, systemAudioMode);
+          ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
+            event,
+            systemAudioMode,
+            systemAudioStrategy,
+            "during warm-start reuse"
+          ));
+          return {
+            success: true,
+            systemAudioMode,
+            systemAudioStrategy,
+            oneOnOneAttendee: meetingOneOnOneAttendee,
+          };
+        }
+
+        if (provider === "local") {
+          meetingLocalMode = true;
+          meetingLocalProvider = normalizedOptions.localProvider || "whisper";
+          meetingLocalModel = normalizedOptions.localModel || null;
+          meetingLocalLanguage = normalizedOptions.language || null;
+          meetingLocalWin = BrowserWindow.fromWebContents(event.sender);
+          meetingLocalBuffers = { mic: [], system: [] };
+          meetingLocalTranscript = "";
+
+          await startLiveSpeakerIdentification(meetingLocalWin, systemAudioMode);
+          await startMeetingAec(systemAudioMode);
+
+          meetingLocalTimer = setInterval(() => {
+            transcribeAllLocalBuffers();
+          }, 5000);
+
+          ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
+            event,
+            systemAudioMode,
+            systemAudioStrategy,
+            "in local meeting mode"
+          ));
+
+          return {
+            success: true,
+            systemAudioMode,
+            systemAudioStrategy,
+            oneOnOneAttendee: meetingOneOnOneAttendee,
+          };
+        }
+
+        await connectRealtimeStreaming(event, normalizedOptions);
+        const realtimeWin = BrowserWindow.fromWebContents(event.sender);
+        await startLiveSpeakerIdentification(realtimeWin, systemAudioMode);
+        await startMeetingAec(systemAudioMode);
+        ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
+          event,
+          systemAudioMode,
+          systemAudioStrategy,
+          "in realtime mode"
+        ));
+        return {
+          success: true,
+          systemAudioMode,
+          systemAudioStrategy,
+          oneOnOneAttendee: meetingOneOnOneAttendee,
+        };
+      } catch (error) {
+        await rollbackMeetingTranscriptionStart();
+        this.meetingDetectionEngine?.setUserRecording(false);
+        debugLogger.error("Meeting transcription start error", { error: error.message });
+        return { success: false, error: error.message };
+      } finally {
+        meetingTranscriptionStartInProgress = false;
+      }
+    });
+
+    ipcMain.on("meeting-transcription-send", (_event, audioBuffer, source) => {
+      sendMeetingAudio(audioBuffer, source);
+    });
+
+    ipcMain.handle("meeting-transcription-stop", async () => {
+      this.meetingDetectionEngine?.setUserRecording(false);
+      try {
+        if (this.audioTapManager) {
+          await this.audioTapManager.stop().catch(() => {});
+        }
+        if (this.linuxPortalAudioManager) {
+          await this.linuxPortalAudioManager.stop().catch(() => {});
+        }
+
+        flushPendingMeetingMicChunks(true);
+        await stopMeetingAec();
+
+        const liveSpeakerState = await stopLiveSpeakerIdentification().catch(() => null);
+
+        const diarizationSessionId = `diar-${Date.now()}`;
+        const diarizationWin = meetingLocalWin || this.windowManager.controlPanelWindow;
+
+        if (meetingLocalMode) {
+          if (meetingLocalTimer) {
+            clearInterval(meetingLocalTimer);
+            meetingLocalTimer = null;
+          }
+          try {
+            await transcribeAllLocalBuffers();
+          } catch (err) {
+            debugLogger.error("Local meeting final transcription failed", { error: err.message });
+          }
+          flushPendingMicFinals(true);
+          const { diarizationPcmPath, diarizationSegments, diarizationStartedAt } =
+            await captureMeetingDiarizationState();
+          const transcript =
+            diarizationSegments
+              .map((segment) => segment.text)
+              .join(" ")
+              .trim() || meetingLocalTranscript;
+          const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
+          const noteIdSnapshot = meetingNoteId;
+          this.activeMeetingSpeakerConfig = null;
+          resetMeetingLocalState();
+
+          this._startOrSkipDiarization(
+            diarizationSessionId,
+            diarizationPcmPath,
+            diarizationStartedAt,
+            diarizationSegments,
+            diarizationWin,
+            liveSpeakerState,
+            sessionSpeakerConfigSnapshot,
+            noteIdSnapshot
+          );
+
+          return { success: true, transcript, diarizationSessionId };
+        }
+
+        const result = await disconnectMeetingStreaming({ flushPending: true });
+        const { diarizationPcmPath, diarizationSegments, diarizationStartedAt } =
+          await captureMeetingDiarizationState();
+        const transcript =
+          diarizationSegments
+            .map((segment) => segment.text)
+            .join(" ")
+            .trim() || result?.text || "";
+
+        const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
+        const noteIdSnapshot = meetingNoteId;
+        this.activeMeetingSpeakerConfig = null;
+
+        this._startOrSkipDiarization(
+          diarizationSessionId,
+          diarizationPcmPath,
+          diarizationStartedAt,
+          diarizationSegments,
+          diarizationWin,
+          liveSpeakerState,
+          sessionSpeakerConfigSnapshot,
+          noteIdSnapshot
+        );
+
+        return { success: true, transcript, diarizationSessionId };
+      } catch (error) {
+        debugLogger.error("Meeting transcription stop error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
 
     ipcMain.handle(
       "start-dictation-preview",

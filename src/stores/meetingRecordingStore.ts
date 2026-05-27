@@ -35,6 +35,11 @@ export interface TranscriptSegment {
   speakerStatus?: TranscriptSpeakerStatus;
   speakerLocked?: boolean;
   speakerLockSource?: TranscriptSpeakerLockSource;
+  // Corti per-segment attribution (multichannel + diarization). channel is the
+  // audio channel index (0 = mic, 1 = system); speakerId is Corti's per-channel
+  // diarized speaker number.
+  cortiChannel?: number | null;
+  cortiSpeakerId?: number | null;
 }
 
 export const SIDE_PANEL_BREAKPOINT_PX = 1024;
@@ -401,6 +406,9 @@ let nextPlaceholderSpeakerIndex = 0;
 let systemPartialSpeakerIdValue: string | null = null;
 let recentSystemSpeaker: RecentSystemSpeaker | null = null;
 let speakerLocks: Map<string, string> = new Map();
+// Maps "channel:speakerId" (Corti's diarized labels) to our local speaker_N
+// IDs so repeated utterances from the same Corti speaker reuse the same slot.
+let cortiSpeakerMap: Map<string, string> = new Map();
 let pushConfigTimeout: ReturnType<typeof setTimeout> | null = null;
 
 export const useMeetingRecordingStore = create<MeetingRecordingState>()(() => ({
@@ -522,8 +530,53 @@ function reserveSpeakerIndex(speakerId?: string) {
   nextPlaceholderSpeakerIndex = Math.max(nextPlaceholderSpeakerIndex, idx + 1);
 }
 
+function resolveCortiSpeakerSlot(segment: TranscriptSegment): string | null {
+  if (segment.cortiSpeakerId == null || segment.cortiChannel == null) return null;
+  // Treat Corti's -1 as "diarization off" — fall through to legacy carry-forward.
+  if (segment.cortiSpeakerId < 0) return null;
+  const key = `${segment.cortiChannel}:${segment.cortiSpeakerId}`;
+  const existing = cortiSpeakerMap.get(key);
+  if (existing) {
+    reserveSpeakerIndex(existing);
+    return existing;
+  }
+  const slot = `speaker_${nextPlaceholderSpeakerIndex}`;
+  nextPlaceholderSpeakerIndex += 1;
+  cortiSpeakerMap.set(key, slot);
+  reserveSpeakerIndex(slot);
+  return slot;
+}
+
 function assignProvisionalSpeaker(segment: TranscriptSegment): TranscriptSegment {
+  // Mic side: in multichannel mode Corti now diarizes within the mic channel too
+  // (multiple in-room speakers). Honor that by giving each Corti mic speakerId
+  // its own slot. Without diarization metadata, mic segments stay unlabeled.
+  if (segment.source === "mic") {
+    if (segment.speaker) return segment;
+    const cortiSlot = resolveCortiSpeakerSlot(segment);
+    if (!cortiSlot) return segment;
+    return normalizeTranscriptSegment({
+      ...segment,
+      speaker: cortiSlot,
+      speakerIsPlaceholder: true,
+      speakerStatus: "provisional",
+    });
+  }
+
   if (segment.source !== "system" || segment.speaker) return segment;
+
+  // System side: prefer Corti's per-channel speakerId for stable grouping
+  // across the meeting — falls back to the carry-forward heuristic when Corti
+  // doesn't supply diarization metadata.
+  const cortiSlot = resolveCortiSpeakerSlot(segment);
+  if (cortiSlot) {
+    return normalizeTranscriptSegment({
+      ...segment,
+      speaker: cortiSlot,
+      speakerIsPlaceholder: true,
+      speakerStatus: "provisional",
+    });
+  }
 
   const nowMs = segment.timestamp ?? Date.now();
   if (systemPartialSpeakerIdValue) {
@@ -701,6 +754,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   recentSystemSpeaker = null;
   speakerLocks = locks;
   systemPartialSpeakerIdValue = null;
+  cortiSpeakerMap = new Map();
 
   useMeetingRecordingStore.setState({
     isRecording: true,
@@ -847,6 +901,8 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         source: "mic" | "system";
         type: "partial" | "final" | "retract";
         timestamp?: number;
+        channel?: number | null;
+        speakerId?: number | null;
       }) => {
         if (data.type === "retract") {
           const next = useMeetingRecordingStore
@@ -886,6 +942,8 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
           text: data.text,
           source: data.source,
           timestamp: data.timestamp,
+          cortiChannel: data.channel ?? null,
+          cortiSpeakerId: data.speakerId ?? null,
         });
 
         for (let i = speakerIdentifications.length - 1; i >= 0; i -= 1) {
