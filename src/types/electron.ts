@@ -1630,6 +1630,8 @@ declare global {
           source: "mic" | "system";
           type: "partial" | "final" | "retract";
           timestamp?: number;
+          channel?: number | null;
+          speakerId?: number | null;
         }) => void
       ) => () => void;
       onMeetingSpeakerIdentified?: (

@@ -1,12 +1,12 @@
-const crypto = require("crypto");
-const { CortiClient } = require("@corti/sdk");
+const WebSocket = require("ws");
 const debugLogger = require("./debugLogger");
 
-const CONNECT_TIMEOUT_MS = 30000;
-const FLUSH_TIMEOUT_MS = 5000;
+const WEBSOCKET_TIMEOUT_MS = 30000;
+const TERMINATION_TIMEOUT_MS = 5000;
+const CONFIG_TIMEOUT_MS = 10000;
+const TOKEN_EXPIRY_BUFFER_MS = 30000;
 const MAX_DEBUG_STRING_LENGTH = 300;
 const AUDIO_BUFFER_MAX_BYTES = 5 * 1024 * 1024;
-const TOKEN_EXPIRY_BUFFER_MS = 30000;
 const WSS_CLOSE_TIMEOUT_MS = 60000;
 
 function buildAudioFormatString(opts = {}) {
@@ -49,85 +49,70 @@ function truncateDebugString(value) {
   return `${value.slice(0, MAX_DEBUG_STRING_LENGTH)}...`;
 }
 
-function summarizeDebugValue(value) {
-  if (typeof value === "string") return truncateDebugString(value);
-  if (Array.isArray(value)) return value.slice(0, 10).map((item) => summarizeDebugValue(item));
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value).map(([key, entryValue]) => [key, summarizeDebugValue(entryValue)])
-  );
-}
+function buildCortiErrorMessage(message, fallbackSummary) {
+  if (typeof message?.message === "string" && message.message.trim()) {
+    return message.message.trim();
+  }
 
-function buildCortiErrorMessage(detail, fallbackSummary) {
-  if (typeof detail?.message === "string" && detail.message.trim()) {
-    return detail.message.trim();
+  if (typeof message?.error === "string" && message.error.trim()) {
+    return message.error.trim();
   }
-  if (typeof detail?.code === "string" && detail.code.trim()) {
-    return `Corti streaming error (${detail.code.trim()})`;
+
+  if (typeof message?.code === "string" && message.code.trim()) {
+    return `Corti streaming error (${message.code.trim()})`;
   }
+
   if (fallbackSummary && typeof fallbackSummary === "object") {
     const summarizedKeys = Object.keys(fallbackSummary).filter((key) => key !== "type");
     if (summarizedKeys.length > 0) {
       return `Corti streaming error: ${JSON.stringify(fallbackSummary)}`;
     }
   }
+
   return "Corti streaming error";
 }
 
-function resolveSdkEnvironment(envConfig) {
-  // Built-in eu/us are accepted as string literals by the SDK; custom regions
-  // need the full URL bundle.
-  if (envConfig?.id === "eu" || envConfig?.id === "us") {
-    return envConfig.id;
-  }
-  const region = envConfig?.region;
-  if (!region) {
-    throw new Error("Corti custom environment requires a region");
-  }
-  return {
-    base: `https://api.${region}.corti.app/v2`,
-    wss: `wss://api.${region}.corti.app/audio-bridge/v2`,
-    login: `https://auth.${region}.corti.app/realms`,
-    agents: `https://api.${region}.corti.app`,
-  };
+function summarizeDebugValue(value) {
+  if (typeof value === "string") return truncateDebugString(value);
+  if (Array.isArray(value)) return value.slice(0, 10).map((item) => summarizeDebugValue(item));
+  if (!value || typeof value !== "object") return value;
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entryValue]) => [key, summarizeDebugValue(entryValue)])
+  );
 }
 
 class CortiTranscribeStreaming {
   constructor(environmentManager, cortiOAuth) {
     this.environmentManager = environmentManager;
     this.cortiOAuth = cortiOAuth;
-
-    // Public callbacks
+    this.ws = null;
+    this.isConnected = false;
+    this.isConfigured = false;
     this.onPartialTranscript = null;
     this.onFinalTranscript = null;
     this.onError = null;
     this.onSessionEnd = null;
-
-    // Session state
-    this.client = null;
-    this.socket = null;
-    this.interactionId = null;
-    this.isConnected = false;
-    this.isConfigured = false;
-    this.isDisconnecting = false;
-    this.hasStreamError = false;
+    this.pendingResolve = null;
+    this.pendingReject = null;
+    this.configResolve = null;
+    this.configReject = null;
+    this.connectionTimeout = null;
+    this.configTimeout = null;
+    this.closeResolve = null;
     this.accumulatedText = "";
     this.finalSegments = [];
     this.audioBytesSent = 0;
-    this.audioBuffer = [];
-    this.audioBufferBytes = 0;
-    this.connectionOptions = null;
-    this.flushResolve = null;
+    this.isDisconnecting = false;
+    this.hasStreamError = false;
     this.lastConfigSummary = null;
     this.lastMessageSummary = null;
-
-    // Warm-idle: keep the WSS open briefly after disconnect so a follow-up
-    // recording skips the REST interaction + WSS handshake round-trip.
+    this.clientCredsCache = { token: null, expiresAt: 0 };
+    this.connectionOptions = null;
+    this.audioBuffer = [];
+    this.audioBufferBytes = 0;
     this.isWarmIdle = false;
     this.idleCloseTimer = null;
-
-    // Client-credentials token cache, used only when PKCE is unavailable.
-    this.clientCredsCache = { token: null, expiresAt: 0, configKey: null };
   }
 
   get completedSegments() {
@@ -135,18 +120,16 @@ class CortiTranscribeStreaming {
   }
 
   async _fetchToken() {
-    // Prefer PKCE — uses stored refresh token, no client secret required.
+    // PKCE first — uses stored refresh token, no secret required
     if (this.cortiOAuth) {
       try {
-        const token = await this.cortiOAuth.getValidAccessToken();
-        if (token) return { accessToken: token };
-      } catch (err) {
-        debugLogger.warn("Corti PKCE token fetch failed; falling back to client_credentials", {
-          error: err?.message,
-        });
+        return await this.cortiOAuth.getValidAccessToken();
+      } catch {
+        // Fall through to client_credentials if a secret is configured
       }
     }
 
+    // Client credentials fallback
     const env = this.environmentManager.getCortiEnvironment();
     const clientId = this.environmentManager.getCortiClientId();
     const clientSecret = this.environmentManager.getCortiClientSecret();
@@ -165,7 +148,7 @@ class CortiTranscribeStreaming {
       this.clientCredsCache.configKey === configKey &&
       Date.now() < this.clientCredsCache.expiresAt - TOKEN_EXPIRY_BUFFER_MS
     ) {
-      return { accessToken: this.clientCredsCache.token };
+      return this.clientCredsCache.token;
     }
 
     const params = new URLSearchParams({
@@ -174,6 +157,7 @@ class CortiTranscribeStreaming {
       client_secret: clientSecret,
       scope: "openid",
     });
+
     const res = await fetch(
       `https://auth.${region}.corti.app/realms/${tenant}/protocol/openid-connect/token`,
       {
@@ -182,16 +166,18 @@ class CortiTranscribeStreaming {
         body: params.toString(),
       }
     );
+
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       throw new Error(`Corti token fetch failed (${res.status}): ${body}`);
     }
+
     const data = await res.json();
     this.clientCredsCache.token = data.access_token;
     this.clientCredsCache.expiresAt = Date.now() + (data.expires_in || 300) * 1000;
     this.clientCredsCache.configKey = configKey;
     debugLogger.debug("Corti client_credentials token fetched", { expiresIn: data.expires_in });
-    return { accessToken: data.access_token, expiresIn: data.expires_in };
+    return this.clientCredsCache.token;
   }
 
   _optionsCompatible(options) {
@@ -214,110 +200,40 @@ class CortiTranscribeStreaming {
     return buildAudioFormatString(this.connectionOptions) === buildAudioFormatString(options);
   }
 
-  _buildClient() {
-    const envConfig = this.environmentManager.getCortiEnvironment();
-    const tenant = this.environmentManager.getCortiTenant() || envConfig.defaultTenant;
-    const sdkEnvironment = resolveSdkEnvironment(envConfig);
-
-    return new CortiClient({
-      environment: sdkEnvironment,
-      tenantName: tenant,
-      auth: {
-        refreshAccessToken: async () => this._fetchToken(),
-      },
-    });
-  }
-
-  async _createInteraction(client) {
-    const now = new Date().toISOString();
-    // endedAt == startedAt at creation marks the encounter as already wrapped
-    // up, so we don't need an explicit close call on disconnect — Corti will
-    // garbage-collect it server-side.
-    const response = await client.interactions.create({
-      encounter: {
-        identifier: `openwhispr-${crypto.randomUUID()}`,
-        status: "planned",
-        type: "first_consultation",
-        period: { startedAt: now, endedAt: now },
-        title: "Dictation",
-      },
-    });
-    if (!response?.interactionId) {
-      throw new Error("Corti create interaction returned no interactionId");
-    }
-    debugLogger.debug("Corti interaction created", { interactionId: response.interactionId });
-    return response.interactionId;
-  }
-
-  _buildStreamConfiguration(options) {
-    const language = normalizeLanguage(options.language);
-    const audioFormat = buildAudioFormatString(options);
-    const punctuationMode = normalizePunctuationMode(options.punctuationMode);
-
-    // The SDK's typed StreamConfigTranscription only exposes primaryLanguage /
-    // isDiarization / participants, but the serializer is configured to
-    // passthrough unrecognized keys. Corti's /audio-bridge endpoint honors
-    // automaticPunctuation, spokenPunctuation, and formatting alongside the
-    // typed fields, so we attach them here.
-    const transcription = {
-      primaryLanguage: language,
-      isDiarization: true,
-      participants: [{ channel: 0, role: "multiple" }],
-    };
-
-    // automaticPunctuation and spokenPunctuation are mutually exclusive.
-    if (punctuationMode === "spoken") {
-      transcription.spokenPunctuation = true;
-    } else if (punctuationMode === "off") {
-      transcription.automaticPunctuation = false;
-    } else {
-      transcription.automaticPunctuation = true;
-    }
-
-    const formatting = sanitizeFormatting(options.formatting);
-    if (formatting) transcription.formatting = formatting;
-
-    return {
-      transcription,
-      mode: { type: "transcription" },
-      audioFormat,
-    };
-  }
-
-  _resetSessionTranscriptState() {
-    this.accumulatedText = "";
-    this.finalSegments = [];
-    this.audioBytesSent = 0;
-    this.hasStreamError = false;
-    this.lastMessageSummary = null;
+  _buildWssUrl(token) {
+    const env = this.environmentManager.getCortiEnvironment();
+    const region = env.region;
+    const tenant = this.environmentManager.getCortiTenant() || env.defaultTenant;
+    const encodedToken = encodeURIComponent(`Bearer ${token}`);
+    return `wss://api.${region}.corti.app/audio-bridge/v2/transcribe?tenant-name=${encodeURIComponent(tenant)}&token=${encodedToken}`;
   }
 
   async connect(options = {}) {
-    // Warm-idle reuse: a previous disconnect left the WSS open. If the new
-    // options match, skip the REST interaction + WSS handshake.
     if (
       this.isWarmIdle &&
       this.isConnected &&
       this.isConfigured &&
-      this.socket &&
+      this.ws?.readyState === WebSocket.OPEN &&
       this._optionsCompatible(options)
     ) {
       debugLogger.debug("Corti reusing warm WSS connection");
       clearTimeout(this.idleCloseTimer);
       this.idleCloseTimer = null;
       this.isWarmIdle = false;
-      this.isDisconnecting = false;
-      this._resetSessionTranscriptState();
-      this.audioBuffer = [];
-      this.audioBufferBytes = 0;
+      this.accumulatedText = "";
+      this.finalSegments = [];
+      this.audioBytesSent = 0;
+      this.hasStreamError = false;
+      this.lastMessageSummary = null;
       return;
     }
 
-    if (this.socket) {
+    if (this.ws) {
       // Either still connected with incompatible options, or warm-idle expired
       // raced; tear down before starting fresh.
-      debugLogger.debug("Corti tearing down stale stream before reconnect", {
+      debugLogger.debug("Corti tearing down stale WSS before reconnect", {
         isWarmIdle: this.isWarmIdle,
+        readyState: this.ws.readyState,
       });
       this.cleanup();
     }
@@ -331,172 +247,272 @@ class CortiTranscribeStreaming {
       punctuationMode: options.punctuationMode,
       formatting: options.formatting,
     };
-    this._resetSessionTranscriptState();
+    this.accumulatedText = "";
+    this.finalSegments = [];
+    this.audioBytesSent = 0;
     this.audioBuffer = [];
     this.audioBufferBytes = 0;
-    this.isDisconnecting = false;
+    this.hasStreamError = false;
+    this.lastMessageSummary = null;
 
-    this.client = this._buildClient();
-
+    let token;
     try {
-      this.interactionId = await this._createInteraction(this.client);
+      token = await this._fetchToken();
     } catch (err) {
-      debugLogger.error("Corti interaction create failed", { error: err.message });
-      this.cleanup();
+      debugLogger.error("Corti token fetch failed during connect", { error: err.message });
       throw err;
     }
 
-    const configuration = this._buildStreamConfiguration(options);
-    this.lastConfigSummary = summarizeDebugValue(configuration);
+    const url = this._buildWssUrl(token);
+    debugLogger.debug("Corti streaming connecting");
 
-    debugLogger.debug("Corti connecting stream", {
-      interactionId: this.interactionId,
-      configuration: this.lastConfigSummary,
-    });
+    return new Promise((resolve, reject) => {
+      this.pendingResolve = resolve;
+      this.pendingReject = reject;
 
-    const connectPromise = this.client.stream.connect({
-      id: this.interactionId,
-      configuration,
-      awaitConfiguration: true,
-      connectionTimeoutInSeconds: Math.ceil(CONNECT_TIMEOUT_MS / 1000),
-    });
+      this.connectionTimeout = setTimeout(() => {
+        this.cleanup();
+        reject(new Error("Corti WebSocket connection timeout"));
+      }, WEBSOCKET_TIMEOUT_MS);
 
-    let socket;
-    try {
-      socket = await connectPromise;
-    } catch (err) {
-      debugLogger.error("Corti stream connect failed", {
-        error: err.message,
-        interactionId: this.interactionId,
-        lastConfig: this.lastConfigSummary,
+      this.ws = new WebSocket(url);
+
+      this.ws.on("open", () => {
+        debugLogger.debug("Corti WebSocket opened, sending config");
+        clearTimeout(this.connectionTimeout);
+        this.connectionTimeout = null;
+
+        const lang = normalizeLanguage(options.language);
+        const audioFormat = buildAudioFormatString(options);
+        const punctuationMode = normalizePunctuationMode(options.punctuationMode);
+
+        const configuration = {
+          primaryLanguage: lang,
+          interimResults: true,
+          audioFormat,
+        };
+
+        // /transcribe supports both spoken and automatic punctuation (mutually exclusive).
+        if (punctuationMode === "spoken") {
+          configuration.spokenPunctuation = true;
+        } else if (punctuationMode === "off") {
+          configuration.automaticPunctuation = false;
+        } else {
+          configuration.automaticPunctuation = true;
+        }
+
+        const formatting = sanitizeFormatting(options.formatting);
+        if (formatting) configuration.formatting = formatting;
+
+        const configMsg = { type: "config", configuration };
+        debugLogger.debug("Corti sending full config", configMsg);
+        this.lastConfigSummary = summarizeDebugValue(configMsg);
+        debugLogger.debug("Corti sending config", this.lastConfigSummary);
+
+        this.configTimeout = setTimeout(() => {
+          this.cleanup();
+          if (this.pendingReject) {
+            this.pendingReject(new Error("Corti CONFIG_TIMEOUT — config not accepted in time"));
+            this.pendingReject = null;
+            this.pendingResolve = null;
+          }
+        }, CONFIG_TIMEOUT_MS);
+
+        try {
+          this.ws.send(JSON.stringify(configMsg));
+        } catch (err) {
+          clearTimeout(this.configTimeout);
+          this.configTimeout = null;
+          this.cleanup();
+          reject(err);
+        }
       });
-      this.cleanup();
-      throw err;
-    }
 
-    this.socket = socket;
-    this.isConnected = true;
-    this.isConfigured = true;
-
-    socket.on("message", (msg) => this._onMessage(msg));
-    socket.on("error", (err) => {
-      debugLogger.error("Corti stream error", {
-        error: err?.message,
-        isConnected: this.isConnected,
-        isConfigured: this.isConfigured,
-        audioBytesSent: this.audioBytesSent,
-        textLength: this.accumulatedText.length,
-        lastMessage: this.lastMessageSummary,
-        lastConfig: this.lastConfigSummary,
+      this.ws.on("message", (data) => {
+        this._onMessage(data);
       });
-      this.hasStreamError = true;
-      this.onError?.(err instanceof Error ? err : new Error(String(err?.message || err)));
-    });
-    socket.on("close", (event) => {
-      const wasActive = this.isConnected;
-      const wasDisconnecting = this.isDisconnecting;
-      const hadStreamError = this.hasStreamError;
-      const wasWarmIdle = this.isWarmIdle;
-      debugLogger.debug("Corti stream closed", {
-        code: event?.code,
-        reason: event?.reason,
-        wasActive,
-        wasDisconnecting,
-        hadStreamError,
-        wasWarmIdle,
-        audioBytesSent: this.audioBytesSent,
-        textLength: this.accumulatedText.length,
-        lastMessage: this.lastMessageSummary,
-      });
-      if (this.flushResolve) {
-        this.flushResolve({ text: this.accumulatedText });
-        this.flushResolve = null;
-      }
-      this.cleanup();
-      if (wasActive && !wasDisconnecting && !hadStreamError && !wasWarmIdle) {
-        this.onError?.(new Error(`Corti connection lost (code: ${event?.code})`));
-      }
-    });
 
-    this._flushAudioBuffer();
+      this.ws.on("error", (error) => {
+        debugLogger.error("Corti WebSocket error", {
+          error: error.message,
+          isConnected: this.isConnected,
+          isConfigured: this.isConfigured,
+          audioBytesSent: this.audioBytesSent,
+          lastMessage: this.lastMessageSummary,
+          lastConfig: this.lastConfigSummary,
+        });
+        if (error.message && (error.message.includes("401") || error.message.includes("403"))) {
+          this.clientCredsCache = { token: null, expiresAt: 0, configKey: null };
+        }
+        this.cleanup();
+        if (this.pendingReject) {
+          this.pendingReject(error);
+          this.pendingReject = null;
+          this.pendingResolve = null;
+        }
+        this.onError?.(error);
+      });
+
+      this.ws.on("close", (code, reason) => {
+        const wasActive = this.isConnected;
+        const wasDisconnecting = this.isDisconnecting;
+        const hadStreamError = this.hasStreamError;
+        const wasWarmIdle = this.isWarmIdle;
+        debugLogger.debug("Corti WebSocket closed", {
+          code,
+          reason: reason?.toString(),
+          wasActive,
+          hasStreamError: hadStreamError,
+          isConfigured: this.isConfigured,
+          isDisconnecting: wasDisconnecting,
+          isWarmIdle: wasWarmIdle,
+          audioBytesSent: this.audioBytesSent,
+          textLength: this.accumulatedText.length,
+          lastMessage: this.lastMessageSummary,
+        });
+        if (this.pendingReject) {
+          this.pendingReject(new Error(`Corti WebSocket closed before ready (code: ${code})`));
+          this.pendingReject = null;
+          this.pendingResolve = null;
+        }
+        if (this.closeResolve) {
+          this.closeResolve({ text: this.accumulatedText });
+        }
+        this.cleanup();
+        if (wasActive && !wasDisconnecting && !hadStreamError && !wasWarmIdle) {
+          this.onError?.(new Error(`Corti connection lost (code: ${code})`));
+        }
+      });
+    });
   }
 
-  _onMessage(message) {
+  _onMessage(data) {
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch (err) {
+      debugLogger.error("Corti message parse error", { error: err.message });
+      return;
+    }
+
     this.lastMessageSummary = summarizeDebugValue(message);
 
     debugLogger.debug("Corti message received", {
-      type: message?.type,
-      keys: message && typeof message === "object" ? Object.keys(message) : [],
+      type: message.type,
+      keys: Object.keys(message || {}),
       payload: this.lastMessageSummary,
     });
 
-    switch (message?.type) {
+    switch (message.type) {
+      case "CONFIG_ACCEPTED":
+        clearTimeout(this.configTimeout);
+        this.configTimeout = null;
+        this.isConnected = true;
+        this.isConfigured = true;
+        debugLogger.debug("Corti CONFIG_ACCEPTED — ready to stream audio");
+        this._flushAudioBuffer();
+        if (this.pendingResolve) {
+          this.pendingResolve();
+          this.pendingResolve = null;
+          this.pendingReject = null;
+        }
+        break;
+
+      case "CONFIG_DENIED":
+        clearTimeout(this.configTimeout);
+        this.configTimeout = null;
+        debugLogger.error("Corti CONFIG_DENIED", {
+          payload: this.lastMessageSummary,
+          lastConfig: this.lastConfigSummary,
+        });
+        this.cleanup();
+        if (this.pendingReject) {
+          this.pendingReject(
+            new Error(`Corti CONFIG_DENIED: ${message.message || "invalid configuration"}`)
+          );
+          this.pendingReject = null;
+          this.pendingResolve = null;
+        }
+        break;
+
+      case "CONFIG_TIMEOUT":
+        clearTimeout(this.configTimeout);
+        this.configTimeout = null;
+        debugLogger.error("Corti CONFIG_TIMEOUT", {
+          lastConfig: this.lastConfigSummary,
+          audioBytesSent: this.audioBytesSent,
+        });
+        this.cleanup();
+        if (this.pendingReject) {
+          this.pendingReject(new Error("Corti CONFIG_TIMEOUT"));
+          this.pendingReject = null;
+          this.pendingResolve = null;
+        }
+        break;
+
       case "transcript": {
-        const segments = Array.isArray(message.data) ? message.data : [];
-        for (const segment of segments) {
-          const text = (segment.transcript || "").trim();
-          if (!text) continue;
-          if (segment.final) {
-            this.finalSegments.push(text);
+        const transcript = message.transcript || message.data;
+        if (!transcript || !transcript.text) break;
+
+        if (transcript.isFinal) {
+          const trimmed = transcript.text.trim();
+          if (trimmed) {
+            this.finalSegments.push(trimmed);
             this.accumulatedText = this.finalSegments.join(" ");
-            debugLogger.debug("Corti final segment", {
-              speakerId: segment.speakerId,
-              text: text.slice(0, 100),
+            this.onFinalTranscript?.(this.accumulatedText, Date.now());
+            debugLogger.debug("Corti final transcript segment", {
+              text: trimmed.slice(0, 100),
               totalLength: this.accumulatedText.length,
             });
-            this.onFinalTranscript?.(this.accumulatedText, Date.now(), {
-              speakerId: segment.speakerId,
-              segmentText: text,
-            });
-          } else {
-            this.onPartialTranscript?.(text);
           }
+        } else {
+          this.onPartialTranscript?.(transcript.text);
         }
         break;
       }
 
       case "flushed":
-        debugLogger.debug("Corti flushed");
-        if (this.flushResolve) {
-          this.flushResolve({ text: this.accumulatedText });
-          this.flushResolve = null;
+        debugLogger.debug("Corti flushed — resolving close");
+        if (this.closeResolve) {
+          this.closeResolve({ text: this.accumulatedText });
+          this.closeResolve = null;
         }
         break;
 
-      case "ENDED":
-        debugLogger.debug("Corti stream ENDED");
-        // Stop accepting audio immediately — the socket close event will
-        // follow shortly and finish teardown.
-        this.isConnected = false;
-        this.onSessionEnd?.({ text: this.accumulatedText });
-        break;
-
-      case "error": {
+      case "error":
         this.hasStreamError = true;
-        const detail = message.error || {};
-        const errMessage = buildCortiErrorMessage(detail, this.lastMessageSummary);
-        debugLogger.error("Corti error message", {
-          error: detail,
+        const errorMessage = buildCortiErrorMessage(message, this.lastMessageSummary);
+        debugLogger.error("Corti streaming error message", {
+          message: message.message,
+          error: message.error,
+          code: message.code,
           payload: this.lastMessageSummary,
+          keys: Object.keys(message || {}),
           isConnected: this.isConnected,
           isConfigured: this.isConfigured,
           audioBytesSent: this.audioBytesSent,
           textLength: this.accumulatedText.length,
           lastConfig: this.lastConfigSummary,
         });
-        this.onError?.(new Error(errMessage));
+        this.onError?.(new Error(errorMessage));
         break;
-      }
 
       default:
-        debugLogger.debug("Corti unknown message type", { type: message?.type });
+        debugLogger.debug("Corti unknown message type", { type: message.type });
     }
   }
 
   sendAudio(buffer) {
-    if (this.isConnected && this.socket) {
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.CLOSING || this.ws.readyState === WebSocket.CLOSED)
+    ) {
+      return false;
+    }
+
+    if (this.isConnected && this.ws?.readyState === WebSocket.OPEN) {
       try {
-        this.socket.sendAudio(buffer);
+        this.ws.send(buffer);
         this.audioBytesSent += buffer.length;
         return true;
       } catch (err) {
@@ -505,13 +521,14 @@ class CortiTranscribeStreaming {
       }
     }
 
-    // Buffer audio that arrives before the stream is configured so the very
-    // first frames aren't dropped during interaction creation + WSS handshake.
+    // Pre-CONFIG_ACCEPTED window — buffer in FIFO order so no audio is lost
+    // during the WSS handshake. Flushed by _flushAudioBuffer() on CONFIG_ACCEPTED.
     if (this.audioBufferBytes + buffer.length > AUDIO_BUFFER_MAX_BYTES) {
       debugLogger.warn("Corti pre-config audio buffer cap exceeded; dropping frame", {
         bufferedBytes: this.audioBufferBytes,
         droppedBytes: buffer.length,
         isConnected: this.isConnected,
+        wsState: this.ws?.readyState,
       });
       return false;
     }
@@ -521,19 +538,23 @@ class CortiTranscribeStreaming {
   }
 
   _flushAudioBuffer() {
-    if (!this.audioBuffer.length || !this.socket) return;
+    if (!this.audioBuffer.length) return;
+
     const queued = this.audioBuffer;
     const queuedBytes = this.audioBufferBytes;
     this.audioBuffer = [];
     this.audioBufferBytes = 0;
+
     debugLogger.debug("Corti flushing pre-config audio buffer", {
       frames: queued.length,
       bytes: queuedBytes,
     });
+
     let flushed = 0;
     for (const chunk of queued) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) break;
       try {
-        this.socket.sendAudio(chunk);
+        this.ws.send(chunk);
         this.audioBytesSent += chunk.length;
         flushed += chunk.length;
       } catch (err) {
@@ -544,6 +565,7 @@ class CortiTranscribeStreaming {
         break;
       }
     }
+
     if (flushed < queuedBytes) {
       debugLogger.warn("Corti pre-config flush incomplete", {
         flushedBytes: flushed,
@@ -553,21 +575,21 @@ class CortiTranscribeStreaming {
   }
 
   async disconnect() {
-    debugLogger.debug("Corti disconnect", {
+    debugLogger.debug("Corti disconnect (soft)", {
       audioBytesSent: this.audioBytesSent,
       textLength: this.accumulatedText.length,
       isWarmIdle: this.isWarmIdle,
     });
 
-    if (!this.socket) return { text: this.accumulatedText };
+    if (!this.ws) return { text: this.accumulatedText };
 
     if (this.isWarmIdle) {
-      // Stop pressed during the keepalive window with no recording in between;
-      // return whatever text we have without disturbing the open WSS.
+      // Stop pressed during the keepalive window (no recording in between);
+      // return whatever text is around without disturbing the WSS.
       return { text: this.accumulatedText };
     }
 
-    if (!this.isConnected) {
+    if (!this.isConnected || this.ws.readyState !== WebSocket.OPEN) {
       const result = { text: this.accumulatedText };
       this.cleanup();
       this.accumulatedText = "";
@@ -575,49 +597,31 @@ class CortiTranscribeStreaming {
       return result;
     }
 
-    this.isDisconnecting = true;
-
     try {
-      this.socket.sendFlush({ type: "flush" });
+      this.ws.send(JSON.stringify({ type: "flush" }));
     } catch (err) {
       debugLogger.error("Corti flush send error", { error: err.message });
     }
 
     let timeoutId;
-    let flushedAcked = false;
     const result = await Promise.race([
       new Promise((resolve) => {
-        this.flushResolve = (value) => {
-          flushedAcked = true;
-          resolve(value);
-        };
+        this.closeResolve = resolve;
       }),
       new Promise((resolve) => {
         timeoutId = setTimeout(() => {
           debugLogger.debug("Corti flush timeout, using accumulated text");
           resolve({ text: this.accumulatedText });
-        }, FLUSH_TIMEOUT_MS);
+        }, TERMINATION_TIMEOUT_MS);
       }),
     ]);
     clearTimeout(timeoutId);
-    this.flushResolve = null;
+    this.closeResolve = null;
 
     const finalText = result?.text || this.accumulatedText;
 
-    // Only send a graceful end after the server acked our flush. If the flush
-    // timed out the connection is already degraded — sending end here can race
-    // and drop pending finals.
-    if (flushedAcked) {
-      try {
-        this.socket.sendEnd({ type: "end" });
-      } catch (err) {
-        debugLogger.error("Corti end send error", { error: err.message });
-      }
-    }
-
-    // Keep the WSS open briefly so a quick follow-up recording can skip the
-    // REST interaction + WSS handshake. The idle timer will tear it down if
-    // no new recording arrives.
+    // Keep the WSS open for WSS_CLOSE_TIMEOUT_MS so a quick follow-up
+    // recording can skip the connect/config round-trip.
     this.isWarmIdle = true;
     this.accumulatedText = "";
     this.finalSegments = [];
@@ -633,24 +637,26 @@ class CortiTranscribeStreaming {
   }
 
   cleanup() {
+    clearTimeout(this.connectionTimeout);
+    this.connectionTimeout = null;
+    clearTimeout(this.configTimeout);
+    this.configTimeout = null;
     clearTimeout(this.idleCloseTimer);
     this.idleCloseTimer = null;
 
-    if (this.socket) {
+    if (this.ws) {
       try {
-        this.socket.close();
-      } catch {
-        // ignore
+        this.ws.close();
+      } catch (err) {
+        // Ignore
       }
-      this.socket = null;
+      this.ws = null;
     }
-    this.client = null;
-    this.interactionId = null;
+
     this.isConnected = false;
     this.isConfigured = false;
-    this.isDisconnecting = false;
     this.isWarmIdle = false;
-    this.flushResolve = null;
+    this.closeResolve = null;
     this.hasStreamError = false;
     this.audioBuffer = [];
     this.audioBufferBytes = 0;
@@ -660,7 +666,8 @@ class CortiTranscribeStreaming {
     this.cleanup();
     this.clientCredsCache = { token: null, expiresAt: 0, configKey: null };
     this.finalSegments = [];
-    this.accumulatedText = "";
+    this.audioBuffer = [];
+    this.audioBufferBytes = 0;
   }
 
   getStatus() {
@@ -668,7 +675,6 @@ class CortiTranscribeStreaming {
       isConnected: this.isConnected,
       isConfigured: this.isConfigured,
       audioBytesSent: this.audioBytesSent,
-      interactionId: this.interactionId,
     };
   }
 }
