@@ -1,5 +1,24 @@
 const debugLogger = require("./debugLogger");
 
+const FORMATTING_OPTIONS = {
+  dates: new Set(["locale:long", "locale:medium", "locale:short", "iso", "as_dictated"]),
+  times: new Set(["locale", "h24", "h12", "as_dictated"]),
+  numbers: new Set(["numerals_above_nine", "numerals", "as_dictated"]),
+  measurements: new Set(["abbreviated", "as_dictated"]),
+  numericRanges: new Set(["numerals", "as_dictated"]),
+  ordinals: new Set(["numerals_above_nine", "numerals", "as_dictated"]),
+};
+
+function sanitizeFormatting(formatting) {
+  if (!formatting || typeof formatting !== "object") return null;
+  const out = {};
+  for (const [key, allowed] of Object.entries(FORMATTING_OPTIONS)) {
+    const v = formatting[key];
+    if (typeof v === "string" && allowed.has(v)) out[key] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 const TOKEN_EXPIRY_BUFFER_MS = 30000;
 const TRANSCRIPT_POLL_INTERVAL_MS = 2000;
 const TRANSCRIPT_SYNC_TIMEOUT_MS = 27000; // Corti syncs up to 25s, poll after
@@ -164,8 +183,22 @@ class CortiManager {
     return json.recordingId;
   }
 
-  async _createTranscript(interactionId, recordingId, language, token) {
+  async _createTranscript(interactionId, recordingId, language, token, options = {}) {
     const lang = language && language !== "auto" ? language : "en";
+    const body = { recordingId, primaryLanguage: lang, isDictation: true };
+
+    const punctuationMode = options.punctuationMode;
+    if (punctuationMode === "spoken") {
+      body.spokenPunctuation = true;
+    } else if (punctuationMode === "off") {
+      body.automaticPunctuation = false;
+    } else {
+      body.automaticPunctuation = true;
+    }
+
+    const formatting = sanitizeFormatting(options.formatting);
+    if (formatting) body.formatting = formatting;
+
     const res = await fetch(
       `${this._baseUrl()}/interactions/${interactionId}/transcripts/`,
       {
@@ -175,7 +208,7 @@ class CortiManager {
           "Tenant-Name": this._getConfig().tenant,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ recordingId, primaryLanguage: lang, isDictation: true }),
+        body: JSON.stringify(body),
       }
     );
 
@@ -260,7 +293,7 @@ class CortiManager {
   }
 
   async transcribeRecording(audioBuffer, options = {}) {
-    const { language } = options;
+    const { language, punctuationMode, formatting } = options;
 
     let token;
     try {
@@ -277,7 +310,8 @@ class CortiManager {
         interactionId,
         recordingId,
         language,
-        token
+        token,
+        { punctuationMode, formatting }
       );
 
       if (completed && syncText) {

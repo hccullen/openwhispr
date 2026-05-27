@@ -848,7 +848,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       metadata.language ||
       (settings.preferredLanguage !== "auto" ? settings.preferredLanguage : null);
 
-    const result = await window.electronAPI.transcribeCortiRest(arrayBuffer, { language });
+    const result = await window.electronAPI.transcribeCortiRest(arrayBuffer, {
+      language,
+      punctuationMode: settings.cortiPunctuationMode || "automatic",
+      formatting: settings.cortiFormatting,
+    });
 
     if (!result.success) {
       const err = new Error(result.error || "Corti transcription failed");
@@ -1000,11 +1004,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       const [, wsResult] = await Promise.all([
         this.cacheMicrophoneDeviceId(),
         (async () => {
-          const { preferredLanguage: warmupLang } = getSettings();
+          const { preferredLanguage: warmupLang, cortiPunctuationMode: warmupPunctuation } =
+            getSettings();
           const res = await provider.warmup({
             sampleRate: 16000,
             language: warmupLang && warmupLang !== "auto" ? warmupLang : undefined,
             keyterms: this.getKeyterms(),
+            punctuationMode: warmupPunctuation || "automatic",
           });
           return res || { success: true, alreadyWarm: false };
         })(),
@@ -1219,11 +1225,17 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       // 4. Connect WebSocket — audio is already flowing from the pipeline above,
       //    so Corti receives data immediately (no idle timeout).
       const result = await (async () => {
-        const { preferredLanguage: preferredLang } = getSettings();
+        const {
+          preferredLanguage: preferredLang,
+          cortiPunctuationMode: punctuationMode,
+          cortiFormatting: formatting,
+        } = getSettings();
         const res = await provider.start({
           sampleRate: 16000,
           language: preferredLang && preferredLang !== "auto" ? preferredLang : undefined,
           keyterms: this.getKeyterms(),
+          punctuationMode: punctuationMode || "automatic",
+          formatting,
         });
 
         if (!res.success) {
