@@ -94,7 +94,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { startMigration, useMigration } from "../stores/noteStore.js";
 import { syncService } from "../services/SyncService.js";
 import { formatBytes } from "../utils/formatBytes";
-import { useSettingsStore } from "../stores/settingsStore";
+import {
+  useSettingsStore,
+  CORTI_FORMATTING_OPTIONS,
+  type CortiFormatting,
+} from "../stores/settingsStore";
 import { canManageSystemAudioInApp } from "../utils/systemAudioAccess";
 import WorkspaceSection from "./settings/WorkspaceSection";
 import { WORKSPACES_ENABLED } from "../lib/features";
@@ -418,6 +422,10 @@ function CortiSettingsPanel() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectError, setConnectError] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const punctuationMode = useSettingsStore((s) => s.cortiPunctuationMode);
+  const setPunctuationMode = useSettingsStore((s) => s.setCortiPunctuationMode);
+  const formatting = useSettingsStore((s) => s.cortiFormatting);
+  const setFormatting = useSettingsStore((s) => s.setCortiFormatting);
 
   useEffect(() => {
     Promise.all([
@@ -540,6 +548,59 @@ function CortiSettingsPanel() {
               <option value="websocket">{t("settingsPage.corti.modeWebsocket")}</option>
               <option value="rest">{t("settingsPage.corti.modeRest")}</option>
             </select>
+          </div>
+
+          {/* Dictation preferences: punctuation */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1 block">
+              {t("settingsPage.corti.punctuationLabel", "Punctuation")}
+            </label>
+            <select
+              className="w-full h-8 rounded-md border border-input bg-background px-2 text-xs"
+              value={punctuationMode}
+              onChange={(e) =>
+                setPunctuationMode(e.target.value as "automatic" | "spoken" | "off")
+              }
+            >
+              <option value="automatic">
+                {t("settingsPage.corti.punctuationAutomatic", "Automatic")}
+              </option>
+              <option value="spoken">
+                {t("settingsPage.corti.punctuationSpoken", "Spoken (say \"comma\", \"period\")")}
+              </option>
+              <option value="off">
+                {t("settingsPage.corti.punctuationOff", "Off")}
+              </option>
+            </select>
+          </div>
+
+          {/* Dictation preferences: formatting — supported on both /transcribe (WSS) and REST */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1 block">
+              {t("settingsPage.corti.formattingLabel", "Formatting")}
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              {(Object.keys(CORTI_FORMATTING_OPTIONS) as (keyof CortiFormatting)[]).map(
+                (field) => (
+                  <div key={field}>
+                    <label className="text-[10px] uppercase tracking-wide text-muted-foreground mb-0.5 block">
+                      {t(`settingsPage.corti.formatting.${field}`, field)}
+                    </label>
+                    <select
+                      className="w-full h-7 rounded-md border border-input bg-background px-2 text-xs"
+                      value={formatting[field]}
+                      onChange={(e) => setFormatting({ [field]: e.target.value })}
+                    >
+                      {CORTI_FORMATTING_OPTIONS[field].map((value) => (
+                        <option key={value} value={value}>
+                          {t(`settingsPage.corti.formattingValues.${value}`, value)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )
+              )}
+            </div>
           </div>
 
           {/* Primary auth action */}

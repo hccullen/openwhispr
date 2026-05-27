@@ -20,6 +20,29 @@ function normalizeLanguage(lang) {
   return lang && lang !== "auto" ? lang : "en";
 }
 
+function normalizePunctuationMode(mode) {
+  return mode === "spoken" || mode === "off" ? mode : "automatic";
+}
+
+const FORMATTING_OPTIONS = {
+  dates: new Set(["locale:long", "locale:medium", "locale:short", "iso", "as_dictated"]),
+  times: new Set(["locale", "h24", "h12", "as_dictated"]),
+  numbers: new Set(["numerals_above_nine", "numerals", "as_dictated"]),
+  measurements: new Set(["abbreviated", "as_dictated"]),
+  numericRanges: new Set(["numerals", "as_dictated"]),
+  ordinals: new Set(["numerals_above_nine", "numerals", "as_dictated"]),
+};
+
+function sanitizeFormatting(formatting) {
+  if (!formatting || typeof formatting !== "object") return null;
+  const out = {};
+  for (const [key, allowed] of Object.entries(FORMATTING_OPTIONS)) {
+    const v = formatting[key];
+    if (typeof v === "string" && allowed.has(v)) out[key] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function truncateDebugString(value) {
   if (typeof value !== "string") return value;
   if (value.length <= MAX_DEBUG_STRING_LENGTH) return value;
@@ -162,6 +185,18 @@ class CortiTranscribeStreaming {
     if (normalizeLanguage(this.connectionOptions.language) !== normalizeLanguage(options.language)) {
       return false;
     }
+    if (
+      normalizePunctuationMode(this.connectionOptions.punctuationMode) !==
+      normalizePunctuationMode(options.punctuationMode)
+    ) {
+      return false;
+    }
+    if (
+      JSON.stringify(sanitizeFormatting(this.connectionOptions.formatting)) !==
+      JSON.stringify(sanitizeFormatting(options.formatting))
+    ) {
+      return false;
+    }
     return buildAudioFormatString(this.connectionOptions) === buildAudioFormatString(options);
   }
 
@@ -209,6 +244,8 @@ class CortiTranscribeStreaming {
       sampleRate: options.sampleRate,
       channels: options.channels,
       bitsPerSample: options.bitsPerSample,
+      punctuationMode: options.punctuationMode,
+      formatting: options.formatting,
     };
     this.accumulatedText = "";
     this.finalSegments = [];
@@ -247,16 +284,27 @@ class CortiTranscribeStreaming {
 
         const lang = normalizeLanguage(options.language);
         const audioFormat = buildAudioFormatString(options);
+        const punctuationMode = normalizePunctuationMode(options.punctuationMode);
 
-        const configMsg = {
-          type: "config",
-          configuration: {
-            primaryLanguage: lang,
-            interimResults: true,
-            automaticPunctuation: true,
-            audioFormat,
-          },
+        const configuration = {
+          primaryLanguage: lang,
+          interimResults: true,
+          audioFormat,
         };
+
+        // /transcribe supports both spoken and automatic punctuation (mutually exclusive).
+        if (punctuationMode === "spoken") {
+          configuration.spokenPunctuation = true;
+        } else if (punctuationMode === "off") {
+          configuration.automaticPunctuation = false;
+        } else {
+          configuration.automaticPunctuation = true;
+        }
+
+        const formatting = sanitizeFormatting(options.formatting);
+        if (formatting) configuration.formatting = formatting;
+
+        const configMsg = { type: "config", configuration };
         debugLogger.debug("Corti sending full config", configMsg);
         this.lastConfigSummary = summarizeDebugValue(configMsg);
         debugLogger.debug("Corti sending config", this.lastConfigSummary);

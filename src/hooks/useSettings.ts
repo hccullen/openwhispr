@@ -27,6 +27,15 @@ export interface TranscriptionSettings {
   cortiEnvironment: string;
   cortiTenant: string;
   cortiTranscriptionMode: "websocket" | "rest";
+  cortiPunctuationMode: "automatic" | "spoken" | "off";
+  cortiFormatting: {
+    dates: string;
+    times: string;
+    numbers: string;
+    measurements: string;
+    numericRanges: string;
+    ordinals: string;
+  };
 }
 
 export interface CleanupSettings {
@@ -210,6 +219,10 @@ function useSettingsInternal() {
     cortiEnvironment: store.cortiEnvironment,
     cortiTenant: store.cortiTenant,
     cortiTranscriptionMode: store.cortiTranscriptionMode,
+    cortiPunctuationMode: store.cortiPunctuationMode,
+    setCortiPunctuationMode: store.setCortiPunctuationMode,
+    cortiFormatting: store.cortiFormatting,
+    setCortiFormatting: store.setCortiFormatting,
     autoGenerateNoteTitle: store.autoGenerateNoteTitle,
     setAutoGenerateNoteTitle: store.setAutoGenerateNoteTitle,
     useCleanupModel: store.useCleanupModel,
